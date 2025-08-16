@@ -1,0 +1,72 @@
+/* App spacing */
+.app-spacer { height: 0.25rem; }
+
+/* Pane header */
+.pane-title {
+	font-weight: 600;
+	font-size: 1.1rem;
+	color: var(--text-color, #f2f5f9);
+	padding: 0.5rem 0;
+	border-bottom: 1px solid rgba(255,255,255,0.06);
+	margin-bottom: 1rem;
+}
+
+/* Buttons */
+.link-btn {
+	background: transparent;
+	border: none;
+	color: var(--primary-color, #2e7ddf);
+	cursor: pointer;
+	font-size: 0.95rem;
+}
+.link-btn:hover { text-decoration: underline; }
+
+/* Collapse buttons are now handled by Streamlit's native button styling */
+
+.upload-btn {
+	background: var(--primary-color, #2e7ddf);
+	border: none;
+	color: white;
+	cursor: pointer;
+	padding: 1rem 2rem;
+	border-radius: 8px;
+	font-size: 1rem;
+	font-weight: 500;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	gap: 0.5rem;
+	width: 100%;
+	transition: background-color 0.2s;
+}
+.upload-btn:hover {
+	background: #1e6bcf;
+}
+
+.upload-icon {
+	font-size: 2rem;
+	font-weight: bold;
+}
+
+.upload-text {
+	font-size: 0.9rem;
+}
+
+.empty-references {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	min-height: 200px;
+}
+
+.upload-prompt {
+	text-align: center;
+}
+
+/* Cards */
+.stContainer > div { border-radius: 8px; }
+
+/* Typography */
+code, pre, .stText, .stMarkdown { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+
+
