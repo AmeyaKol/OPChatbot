@@ -4,6 +4,14 @@ from typing import Generator, List, Dict, Optional, Tuple
 import streamlit as st
 from dotenv import load_dotenv
 
+# Import Qdrant utilities
+try:
+    from qdrant_utils import qdrant_manager, search_qdrant, add_document_to_qdrant
+    HAS_QDRANT = True
+except ImportError:
+    HAS_QDRANT = False
+    st.warning("Qdrant utilities not available. Install dependencies with: pip install -r requirements.txt")
+
 # streamlit-code-editor not available, using enhanced textarea fallback
 HAS_CODE_EDITOR = False
 
@@ -44,6 +52,12 @@ def ensure_state_defaults() -> None:
     # New chat mode toggle
     if "chat_mode" not in st.session_state:
         st.session_state.chat_mode = "discuss"  # "discuss" or "update"
+    
+    # Qdrant integration variables
+    if "qdrant_references" not in st.session_state:
+        st.session_state.qdrant_references = []  # list[{doc_id, content, score, metadata}]
+    if "qdrant_initialized" not in st.session_state:
+        st.session_state.qdrant_initialized = False
 
 
 # -------------------------
@@ -90,6 +104,20 @@ def naive_summarize(text: str, max_chars: int) -> str:
 def gather_context(document_text: str, references: List[Dict[str, str]]) -> Tuple[str, List[Dict[str, str]]]:
     doc = document_text or ""
     refs = references or []
+    
+    # Include Qdrant references if available
+    qdrant_refs = st.session_state.get("qdrant_references", [])
+    if qdrant_refs:
+        # Convert Qdrant results to the same format as manual references
+        for qr in qdrant_refs:
+            refs.append({
+                "name": f"Qdrant: {qr.get('doc_id', 'document')} (Score: {qr.get('score', 0):.3f})",
+                "content": qr.get("content", "")
+            })
+    
+    # If no references at all, provide empty reference section
+    if not refs:
+        refs = [{"name": "No References", "content": "No relevant documents or references found."}]
 
     total_chars = len(doc) + sum(len(r.get("content", "")) for r in refs)
     if total_chars <= SAFE_PROMPT_CHAR_LIMIT:
@@ -105,10 +133,12 @@ def gather_context(document_text: str, references: List[Dict[str, str]]) -> Tupl
     if remaining > 0 and refs:
         per_ref_budget = max(1200, remaining // max(1, len(refs)))
         for r in refs:
-            summarized_refs.append({
-                "name": r.get("name", "reference.txt"),
-                "content": naive_summarize(r.get("content", ""), per_ref_budget),
-            })
+            # Skip the "No References" placeholder when summarizing
+            if r.get("name") != "No References":
+                summarized_refs.append({
+                    "name": r.get("name", "reference.txt"),
+                    "content": naive_summarize(r.get("content", ""), per_ref_budget),
+                })
     else:
         summarized_refs = refs
 
@@ -180,12 +210,25 @@ def build_prompt(user_message: str, document_text: str, references: List[Dict[st
     lines.append("")
 
     if references_final:
-        lines.append("Uploaded References:")
-        for idx, r in enumerate(references_final, start=1):
-            name = r.get("name", f"reference_{idx}.txt")
-            content = r.get("content", "")
-            lines.append(f"--- Reference {idx}: {name} ---\n{content}")
-        lines.append("")
+        # Check if we have Qdrant references
+        qdrant_refs = [r for r in references_final if r.get("name", "").startswith("Qdrant:")]
+        manual_refs = [r for r in references_final if not r.get("name", "").startswith("Qdrant:") and r.get("name") != "No References"]
+        
+        if qdrant_refs:
+            lines.append("AI-Searchable References (Qdrant):")
+            for idx, r in enumerate(qdrant_refs, start=1):
+                name = r.get("name", f"qdrant_reference_{idx}")
+                content = r.get("content", "")
+                lines.append(f"--- Reference {idx}: {name} ---\n{content}")
+            lines.append("")
+        
+        if manual_refs:
+            lines.append("Uploaded References:")
+            for idx, r in enumerate(manual_refs, start=1):
+                name = r.get("name", f"reference_{idx}.txt")
+                content = r.get("content", "")
+                lines.append(f"--- Reference {idx}: {name} ---\n{content}")
+            lines.append("")
 
     lines.append("User message:\n" + (user_message or ""))
     return "\n\n".join(lines)
@@ -330,6 +373,21 @@ def render_chat_pane() -> None:
     mode_emoji = "💬" if st.session_state.chat_mode == "discuss" else "✏️"
     mode_name = "Discuss" if st.session_state.chat_mode == "discuss" else "Update"
     st.info(f"{mode_emoji} **{mode_name} Mode Active** - {('AI will chat using document/references as context' if st.session_state.chat_mode == 'discuss' else 'AI will update the document based on your instructions')}")
+    
+    # Show current Qdrant references being used as context
+    qdrant_refs = st.session_state.get("qdrant_references", [])
+    if qdrant_refs:
+        with st.expander(f"🔍 **AI-Searchable Context** ({len(qdrant_refs)} documents)", expanded=False):
+            st.markdown("**These documents are currently being used as context for your chat:**")
+            for idx, ref in enumerate(qdrant_refs):
+                doc_id = ref.get("doc_id", f"doc_{idx}")
+                score = ref.get("score", 0)
+                content_preview = ref.get("content", "")[:150] + "..." if len(ref.get("content", "")) > 150 else ref.get("content", "")
+                st.markdown(f"**📄 {doc_id}** (Relevance: {score:.3f})")
+                st.text(content_preview)
+                st.divider()
+    elif st.session_state.get("qdrant_initialized", False):
+        st.info("💡 **No AI-searchable documents found.** Use the 'Find Resources' button in the References pane to search for relevant documents.")
 
     # Render chat history
     for idx, turn in enumerate(st.session_state.chat_history):
@@ -343,8 +401,14 @@ def render_chat_pane() -> None:
         st.rerun()
 
     # Chat input
-    placeholder_text = ("Enter instructions to update the document..." if st.session_state.chat_mode == "update" 
-                       else "Ask about the document or references...")
+    qdrant_refs = st.session_state.get("qdrant_references", [])
+    if qdrant_refs:
+        placeholder_text = ("Enter instructions to update the document using the found references..." if st.session_state.chat_mode == "update" 
+                           else f"Ask about the document or the {len(qdrant_refs)} found references...")
+    else:
+        placeholder_text = ("Enter instructions to update the document..." if st.session_state.chat_mode == "update" 
+                           else "Ask about the document or references...")
+    
     user_message = st.chat_input(placeholder_text, key="chat_input")
     
     if user_message:
@@ -415,13 +479,24 @@ def render_document_pane() -> None:
     updated_text: Optional[str] = None
 
     # Document header with save button
-    col1, col2 = st.columns([4, 1])
+    col1, col2, col3 = st.columns([3, 1, 1])
     with col1:
         st.markdown("**Document Content**")
     with col2:
         if st.button("💾 Save", key="save_doc_btn", help="Save document", use_container_width=True):
             st.success("Document saved!")
             st.rerun()
+    with col3:
+        if HAS_QDRANT and st.button("🗄️ Add to Qdrant", key="add_to_qdrant_btn", help="Add document to vector database", use_container_width=True):
+            if st.session_state.document_text.strip():
+                # Generate a numeric ID for Qdrant (it requires integers or UUIDs)
+                doc_id = abs(hash(st.session_state.document_text)) % 1000000  # Use hash modulo for unique numeric ID
+                if add_document_to_qdrant(doc_id, st.session_state.document_text):
+                    st.success("✅ Document added to Qdrant!")
+                else:
+                    st.error("❌ Failed to add document to Qdrant")
+            else:
+                st.warning("Please add some text to the document first")
     
     # Simple manual text selection for chat context
     st.markdown("**Manual Text Selection for Chat:**")
@@ -478,59 +553,195 @@ def render_reference_pane() -> None:
 
     sticky_header("📁 References", "ref")
 
-    # Hide the default file uploader since we have our custom button
-    uploaded_files = None
-    if "file_uploader_trigger" in st.session_state and st.session_state.file_uploader_trigger:
-        uploaded_files = st.file_uploader(
-            "Upload .txt files",
-            accept_multiple_files=True,
-            type=["txt"],
-            key="upload_files_hidden",
-            label_visibility="hidden"
-        )
-        if uploaded_files:
-            st.session_state.file_uploader_trigger = False
-    if uploaded_files:
-        refs: List[Dict[str, str]] = []
-        for f in uploaded_files:
-            try:
-                content = f.read().decode("utf-8", errors="ignore")
-            except Exception:
-                content = ""
-            refs.append({"name": f.name, "content": content})
-        st.session_state.references = refs
+    # Create tabs for different reference types
+    tab1, tab2 = st.tabs(["📁 Uploads", "🔍 Qdrant References"])
+    
+    # Tab 1: Manual Uploads (existing functionality)
+    with tab1:
+        # Hide the default file uploader since we have our custom button
+        uploaded_files = None
+        if "file_uploader_trigger" in st.session_state and st.session_state.file_uploader_trigger:
+            uploaded_files = st.file_uploader(
+                "Upload .txt files",
+                accept_multiple_files=True,
+                type=["txt"],
+                key="upload_files_hidden",
+                label_visibility="hidden"
+            )
+            if uploaded_files:
+                st.session_state.file_uploader_trigger = False
+                refs: List[Dict[str, str]] = []
+                for f in uploaded_files:
+                    try:
+                        content = f.read().decode("utf-8", errors="ignore")
+                    except Exception:
+                        content = ""
+                    refs.append({"name": f.name, "content": content})
+                st.session_state.references = refs
 
-    # Render previews
-    if not st.session_state.references:
-        st.markdown('<div class="empty-references"><div class="upload-prompt">', unsafe_allow_html=True)
-        if st.button("📁 Upload Document", key="custom_upload_btn", use_container_width=True, type="primary"):
-            st.session_state.file_uploader_trigger = True
-            st.rerun()
-        st.markdown('</div></div>', unsafe_allow_html=True)
-        return
-
-    for idx, r in enumerate(st.session_state.references):
-        name = r.get("name", f"reference_{idx}.txt")
-        content = r.get("content", "")
-        preview, truncated = truncate_for_preview(content, TRUNCATED_PREVIEW_CHARS)
-        with st.container(border=True):
-            st.markdown(f"**{name}**")
-            st.text(preview)
-            cols = st.columns([1, 1, 6])
-            with cols[0]:
-                if st.button("Copy preview", key=f"copy_prev_{idx}"):
-                    # Best-effort copy via a tiny JS snippet
-                    st.components.v1.html(
-                        f"""
-                        <script>
-                          navigator.clipboard.writeText({preview!r});
-                        </script>
-                        """,
-                        height=0,
-                    )
-                    st.toast("Preview copied to clipboard")
-            with cols[1]:
-                st.caption("Truncated" if truncated else "Full")
+        # Render previews
+        if not st.session_state.references:
+            st.markdown('<div class="empty-references"><div class="upload-prompt">', unsafe_allow_html=True)
+            if st.button("📁 Upload Document", key="custom_upload_btn", use_container_width=True, type="primary"):
+                st.session_state.file_uploader_trigger = True
+                st.rerun()
+            st.markdown('</div></div>', unsafe_allow_html=True)
+        else:
+            for idx, r in enumerate(st.session_state.references):
+                name = r.get("name", f"reference_{idx}.txt")
+                content = r.get("content", "")
+                preview, truncated = truncate_for_preview(content, TRUNCATED_PREVIEW_CHARS)
+                with st.container(border=True):
+                    st.markdown(f"**{name}**")
+                    st.text(preview)
+                    cols = st.columns([1, 1, 6])
+                    with cols[0]:
+                        if st.button("Copy preview", key=f"copy_prev_{idx}"):
+                            # Best-effort copy via a tiny JS snippet
+                            st.components.v1.html(
+                                f"""
+                                <script>
+                                  navigator.clipboard.writeText({preview!r});
+                                </script>
+                                """,
+                                height=0,
+                            )
+                            st.toast("Preview copied to clipboard")
+                    with cols[1]:
+                        st.caption("Truncated" if truncated else "Full")
+    
+    # Tab 2: Qdrant References (new functionality)
+    with tab2:
+        if not HAS_QDRANT:
+            st.error("Qdrant is not available. Please install dependencies.")
+            return
+            
+        # Initialize Qdrant if not done yet
+        if not st.session_state.qdrant_initialized:
+            with st.spinner("Initializing Qdrant..."):
+                if qdrant_manager.initialize():
+                    st.session_state.qdrant_initialized = True
+                    st.success("✅ Qdrant connected successfully!")
+                else:
+                    st.error("❌ Failed to connect to Qdrant. Please check your setup.")
+                    return
+        
+        # Show Qdrant status
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            st.markdown("**🔍 Find Relevant Resources**")
+            st.markdown("Search for documents similar to your current text using AI-powered semantic search.")
+        
+        with col2:
+             if st.button("🔍 Find Resources", key="find_resources_btn", use_container_width=True, type="primary"):
+                 if st.session_state.document_text.strip():
+                     with st.spinner("Searching for relevant documents..."):
+                         # Search Qdrant for similar documents
+                         query = st.session_state.document_text[:500]  # Use first 500 chars as query
+                         results = search_qdrant(query, top_k=5)
+                         st.session_state.qdrant_references = results
+                         
+                         # Show search debug info
+                         if results:
+                             st.success(f"Found {len(results)} relevant documents!")
+                             
+                             # Debug: Show what was searched
+                             with st.expander("🔍 Search Debug Info", expanded=False):
+                                 st.write(f"**Query:** {query[:100]}{'...' if len(query) > 100 else ''}")
+                                 st.write(f"**Query length:** {len(query)} characters")
+                                 st.write(f"**Results found:** {len(results)}")
+                                 
+                                 # Show top result details
+                                 if results:
+                                     top_result = results[0]
+                                     st.write(f"**Top result score:** {top_result.get('score', 0):.3f}")
+                                     st.write(f"**Top result ID:** {top_result.get('doc_id', 'N/A')}")
+                         else:
+                             st.info("No relevant documents found. Try adding some documents to Qdrant first.")
+                             
+                             # Debug: Show why no results
+                             with st.expander("🔍 Search Debug Info", expanded=False):
+                                 st.write(f"**Query:** {query[:100]}{'...' if len(query) > 100 else ''}")
+                                 st.write(f"**Query length:** {len(query)} characters")
+                                 st.write("**Possible reasons:**")
+                                 st.write("- Query too short or generic")
+                                 st.write("- No semantic similarity to existing documents")
+                                 st.write("- Score threshold too high")
+                 else:
+                     st.warning("Please add some text to the document pane first.")
+        
+        # Display Qdrant search results
+        if st.session_state.qdrant_references:
+            st.markdown("**📚 Found Documents:**")
+            for idx, result in enumerate(st.session_state.qdrant_references):
+                with st.container(border=True):
+                    doc_id = result.get("doc_id", f"doc_{idx}")
+                    content = result.get("content", "")
+                    score = result.get("score", 0)
+                    metadata = result.get("metadata", {})
+                    
+                    # Header with score
+                    st.markdown(f"**📄 {doc_id}** (Similarity: {score:.3f})")
+                    
+                    # Content preview
+                    preview, truncated = truncate_for_preview(content, TRUNCATED_PREVIEW_CHARS)
+                    st.text(preview)
+                    
+                    # Metadata info
+                    if metadata:
+                        with st.expander("📊 Metadata"):
+                            for key, value in metadata.items():
+                                st.write(f"**{key}:** {value}")
+                    
+                    # Actions
+                    cols = st.columns([1, 1, 1, 3])
+                    with cols[0]:
+                        if st.button("Copy", key=f"copy_qdrant_{idx}"):
+                            st.components.v1.html(
+                                f"""
+                                <script>
+                                  navigator.clipboard.writeText({content!r});
+                                </script>
+                                """,
+                                height=0,
+                            )
+                            st.toast("Content copied to clipboard")
+                    
+                    with cols[1]:
+                        if st.button("Use as Context", key=f"use_context_{idx}"):
+                            st.session_state.selected_text = content
+                            st.success("Added to chat context!")
+                    
+                    with cols[2]:
+                        st.caption("Truncated" if truncated else "Full")
+        else:
+            st.info("💡 Click 'Find Resources' to search for relevant documents based on your current text.")
+            
+            # Show collection info
+            if st.session_state.qdrant_initialized:
+                with st.expander("📊 Qdrant Collection Info"):
+                    info = qdrant_manager.get_collection_info()
+                    if info:
+                        st.write(f"**Collection:** {info.get('name', 'N/A')}")
+                        st.write(f"**Vector Size:** {info.get('vector_size', 'N/A')}")
+                        st.write(f"**Documents:** {info.get('points_count', 'N/A')}")
+                    else:
+                        st.write("Collection info not available")
+            
+            # Show usage instructions
+            st.info("""
+            **💡 How to use AI-Searchable References:**
+            
+            1. **Search**: Type text in the Document pane and click "Find Resources"
+            2. **Chat**: Found documents automatically become context for the chatbot
+            3. **Discuss Mode**: Ask questions about the found documents
+            4. **Update Mode**: Use the documents as reference to update your text
+            
+            **Example queries to try:**
+            - "What are the main points about AI in the found documents?"
+            - "Summarize the programming concepts mentioned"
+            - "How do the documents relate to climate change?"
+            """)
 
 
 # -------------------------
